@@ -1,0 +1,6 @@
+.env
+.venv/
+.runtime/
+__pycache__/
+python-service/__pycache__/
+target/
