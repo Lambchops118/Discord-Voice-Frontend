@@ -149,7 +149,7 @@ impl BotHandler {
 
         if let Some(call) = self.state.songbird.get(guild_id) {
             let current_channel = call.lock().await.current_channel();
-            if current_channel == Some(channel_id) {
+            if current_channel == Some(channel_id.into()) {
                 msg.reply(&ctx.http, "I am already in your voice channel.")
                     .await
                     .context("failed to send already-connected reply")?;
@@ -249,7 +249,7 @@ impl BotHandler {
             match current_channel {
                 Some(channel_id) => format!(
                     "Connected to <#{}>. Python service reachable: {}",
-                    channel_id.get(),
+                    channel_id.0.get(),
                     self.state.python.health().await.is_ok()
                 ),
                 None => "A voice handler exists, but it is not connected.".to_string(),

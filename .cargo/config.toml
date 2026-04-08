@@ -1,0 +1,4 @@
+[env]
+# Ensure Windows Cargo can find the CMake binary when invoked from this repo.
+CMAKE = "C:/Program Files/CMake/bin/cmake.exe"
+CMAKE_GENERATOR = "NMake Makefiles"

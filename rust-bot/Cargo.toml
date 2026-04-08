@@ -17,3 +17,6 @@ symphonia = { version = "0.5", features = ["mp3", "wav", "pcm"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.dev.package.audiopus_sys]
+opt-level = 1
