@@ -15,7 +15,7 @@ use serenity::{
     },
 };
 use songbird::{
-    driver::{Channels, DecodeMode, SampleRate},
+    driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
     input::File as SongbirdFile,
     model::payload::Speaking,
     Event, EventContext as VoiceEventContext, EventHandler as VoiceEventHandler, SerenityInit,
@@ -557,10 +557,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to create runtime directory {}", playback_root.display()))?;
 
     let audio_config = AudioPipelineConfig::from_env();
-    let songbird_config = songbird::Config::default()
-        .decode_mode(DecodeMode::Decode)
-        .decode_channels(Channels::Mono)
-        .decode_sample_rate(SampleRate::Hz16000);
+    let songbird_config = songbird::Config::default().decode_mode(DecodeMode::Decode(
+        DecodeConfig::new(Channels::Mono, SampleRate::Hz16000),
+    ));
     let songbird = Songbird::serenity_from_config(songbird_config);
 
     let state = BotState {

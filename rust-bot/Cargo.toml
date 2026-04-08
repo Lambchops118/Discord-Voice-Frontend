@@ -12,11 +12,11 @@ hound = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "http", "model", "rustls_backend", "cache"] }
-songbird = { version = "0.5", features = ["receive", "builtin-queue", "serenity", "rustls"] }
+songbird = { git = "https://github.com/serenity-rs/songbird.git", branch = "next", features = ["receive", "builtin-queue", "serenity", "rustls"] }
 symphonia = { version = "0.5", features = ["mp3", "wav", "pcm"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-[profile.dev.package.audiopus_sys]
+[profile.dev.package.libopus_sys]
 opt-level = 1
