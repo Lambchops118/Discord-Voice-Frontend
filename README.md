@@ -211,6 +211,7 @@ Edge cases handled:
    - `butler hello`
    - `monkey, what time is it`
    - `monkey butler say test successful`
+   - `butler who is speaking`
 7. Confirm Rust logs show:
    - speaking SSRC mapped to a Discord user
    - receiving audio frames
@@ -241,6 +242,11 @@ Example flow:
 8. Rust queues the MP3 into the Songbird call only when `should_respond = true`
 9. Bot speaks the reply
 10. User sends `!leave`
+
+Example speaker-aware query:
+
+- `butler who is speaking`
+  - Bot replies with the resolved Discord display name for the user attached to that utterance, for example `Alice is speaking.`
 
 ## Logging and Debugging
 

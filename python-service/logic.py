@@ -22,12 +22,16 @@ def strip_wake_words(transcript: str) -> str:
     return stripped or transcript.strip()
 
 
-def choose_reply(transcript: str) -> str:
+def choose_reply(transcript: str, speaker_name: str | None = None) -> str:
     content = strip_wake_words(transcript)
     normalized = normalize_text(content)
 
     if normalized in {"hello", "hello bot", "hi", "hey"} or "hello bot" in normalized:
         return "Hello! Voice pipeline is working."
+    if normalized in {"who is speaking", "who s speaking"}:
+        if speaker_name:
+            return f"{speaker_name} is speaking."
+        return "I can't tell who is speaking yet."
     if "what time is it" in normalized:
         current_time = datetime.now().strftime("%I:%M %p").lstrip("0")
         return f"It is {current_time}."

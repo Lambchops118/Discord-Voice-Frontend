@@ -31,6 +31,7 @@ pub struct DiscordSpeakerProfile {
     pub discord_user_id: u64,
     pub username: String,
     pub display_name: String,
+    pub is_bot: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,7 @@ impl DiscordSpeakerProfile {
             discord_user_id: member.user.id.get(),
             username: member.user.name.clone(),
             display_name: member.display_name().to_string(),
+            is_bot: member.user.bot,
         }
     }
 }
@@ -126,7 +128,7 @@ impl SpeakerRegistry {
         };
 
         let Some(discord_user_id) = state.active_ssrc_map.get(&ssrc).copied() else {
-            return Self::unknown_speaker(ssrc);
+            return Self::resolve_single_participant_fallback(&state, ssrc);
         };
 
         if let Some(profile) = state.profiles.get(&discord_user_id) {
@@ -159,6 +161,31 @@ impl SpeakerRegistry {
             ssrc,
             resolved_via: "ssrc_map_user_only",
         }
+    }
+
+    fn resolve_single_participant_fallback(
+        state: &SpeakerRegistryState,
+        ssrc: u32,
+    ) -> ResolvedSpeaker {
+        let mut candidates = state
+            .profiles
+            .values()
+            .filter(|profile| !profile.is_bot)
+            .collect::<Vec<_>>();
+
+        if candidates.len() == 1 {
+            let profile = candidates.remove(0);
+            return ResolvedSpeaker {
+                speaker_id: format!("discord:{}", profile.discord_user_id),
+                discord_user_id: Some(profile.discord_user_id),
+                discord_username: Some(profile.username.clone()),
+                discord_display_name: Some(profile.display_name.clone()),
+                ssrc,
+                resolved_via: "single_channel_member",
+            };
+        }
+
+        Self::unknown_speaker(ssrc)
     }
 
     pub fn record_utterance(&self, speaker: &ResolvedSpeaker) {

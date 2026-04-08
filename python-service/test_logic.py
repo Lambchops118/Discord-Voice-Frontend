@@ -1,6 +1,6 @@
 import unittest
 
-from logic import is_addressed
+from logic import choose_reply, is_addressed
 
 
 class WakeWordTests(unittest.TestCase):
@@ -18,6 +18,18 @@ class WakeWordTests(unittest.TestCase):
 
     def test_rejects_unaddressed_transcript(self) -> None:
         self.assertFalse(is_addressed("this is just normal channel chatter"))
+
+    def test_reports_current_speaker_name(self) -> None:
+        self.assertEqual(
+            choose_reply("butler who is speaking", "Alice"),
+            "Alice is speaking.",
+        )
+
+    def test_reports_unknown_current_speaker(self) -> None:
+        self.assertEqual(
+            choose_reply("butler who's speaking", None),
+            "I can't tell who is speaking yet.",
+        )
 
 
 if __name__ == "__main__":

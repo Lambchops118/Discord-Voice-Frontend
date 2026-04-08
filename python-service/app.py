@@ -199,7 +199,7 @@ async def process_audio(request: AudioProcessRequest) -> AudioProcessResponse:
             ignore_reason="not_addressed",
         )
 
-    reply_text = choose_reply(transcript)
+    reply_text = choose_reply(transcript, speaker_label)
     tts_audio = await voice_service.synthesize_tts(reply_text)
     return AudioProcessResponse(
         transcript=transcript,
