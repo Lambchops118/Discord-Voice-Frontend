@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from conversation_store import ConversationMessage, ConversationStore
-from logic import is_addressed, strip_wake_words
+from logic import is_addressed, strip_wake_words, wake_word_required
 from prompt_builder import (
     PromptParticipant,
     PromptSpeaker,
@@ -37,6 +37,12 @@ class WakeWordTests(unittest.TestCase):
             strip_wake_words("butler, what time is it"),
             "what time is it",
         )
+
+    def test_requires_wake_word_in_group_calls(self) -> None:
+        self.assertTrue(wake_word_required(2))
+
+    def test_does_not_require_wake_word_in_one_on_one_call(self) -> None:
+        self.assertFalse(wake_word_required(1))
 
 
 class ConversationStoreTests(unittest.TestCase):

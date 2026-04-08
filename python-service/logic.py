@@ -18,6 +18,10 @@ def is_addressed(transcript: str) -> bool:
     return WAKE_PATTERN.search(normalized) is not None
 
 
+def wake_word_required(participant_count: int) -> bool:
+    return participant_count != 1
+
+
 def strip_wake_words(transcript: str) -> str:
     stripped = WAKE_PATTERN.sub(" ", transcript, count=1)
     stripped = re.sub(r"\s+", " ", stripped).strip(" ,.!?:;-")

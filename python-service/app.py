@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from faster_whisper import WhisperModel
 from llm_client import OpenAIConfig, OpenAILLMClient
-from logic import is_addressed, strip_wake_words
+from logic import is_addressed, strip_wake_words, wake_word_required
 from pydantic import BaseModel, Field
 from prompt_builder import (
     PromptParticipant,
@@ -282,7 +282,9 @@ async def process_audio(request: AudioProcessRequest) -> AudioProcessResponse:
         )
 
     now = datetime.now().astimezone()
-    addressed = is_addressed(transcript)
+    participant_count = len(request.users_in_call)
+    requires_wake_word = wake_word_required(participant_count)
+    addressed = is_addressed(transcript) if requires_wake_word else True
     recent_messages = voice_service.conversations.recent_messages(request.guild_id)
     should_attempt_reply = addressed
     user_text = strip_wake_words(transcript) if addressed else transcript
@@ -298,10 +300,12 @@ async def process_audio(request: AudioProcessRequest) -> AudioProcessResponse:
         ),
     )
     logger.info(
-        "transcript analyzed utterance_id=%s speaker=%s transcript=%r addressed=%s should_attempt_reply=%s",
+        "transcript analyzed utterance_id=%s speaker=%s transcript=%r participants=%s requires_wake_word=%s addressed=%s should_attempt_reply=%s",
         request.utterance_id,
         speaker_label,
         transcript,
+        participant_count,
+        requires_wake_word,
         addressed,
         should_attempt_reply,
     )

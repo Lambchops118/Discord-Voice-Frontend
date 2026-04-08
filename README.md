@@ -247,7 +247,8 @@ Matching is case-insensitive and normalized across simple punctuation and spacin
 
 Reply behavior is now:
 
-- respond immediately when the utterance includes a wake name
+- in a one-on-one voice session, the bot can respond without a wake name
+- in calls with multiple human participants, the utterance must include a wake name
 - otherwise return a no-op response and do not enqueue playback
 
 Edge cases handled:
