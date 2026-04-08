@@ -4,7 +4,7 @@ use serenity::model::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,6 +22,7 @@ pub struct SpeakerRegistry {
 #[derive(Debug, Default)]
 struct SpeakerRegistryState {
     active_ssrc_map: HashMap<u32, u64>,
+    in_channel_users: HashSet<u64>,
     profiles: HashMap<u64, DiscordSpeakerProfile>,
     speaker_log: HashMap<u64, VoiceIdentityRecord>,
 }
@@ -100,7 +101,10 @@ impl SpeakerRegistry {
             state.profiles.insert(profile.discord_user_id, profile);
         }
 
-        if !is_in_session_channel {
+        if is_in_session_channel {
+            state.in_channel_users.insert(user_id.get());
+        } else {
+            state.in_channel_users.remove(&user_id.get());
             state.active_ssrc_map.retain(|_, mapped_user_id| *mapped_user_id != user_id.get());
         }
     }
@@ -168,8 +172,9 @@ impl SpeakerRegistry {
         ssrc: u32,
     ) -> ResolvedSpeaker {
         let mut candidates = state
-            .profiles
-            .values()
+            .in_channel_users
+            .iter()
+            .filter_map(|user_id| state.profiles.get(user_id))
             .filter(|profile| !profile.is_bot)
             .collect::<Vec<_>>();
 
@@ -252,6 +257,25 @@ impl SpeakerRegistry {
                 debug!(path = %path.display(), "persisted speaker registry");
             }
         });
+    }
+
+    pub fn current_participants(&self) -> Vec<DiscordSpeakerProfile> {
+        let state = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                warn!(?error, guild_id = self.guild_id.get(), "speaker registry lock poisoned");
+                return Vec::new();
+            }
+        };
+
+        let mut participants = state
+            .in_channel_users
+            .iter()
+            .filter_map(|user_id| state.profiles.get(user_id).cloned())
+            .filter(|profile| !profile.is_bot)
+            .collect::<Vec<_>>();
+        participants.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+        participants
     }
 
     fn snapshot_json(&self) -> Result<Vec<u8>, serde_json::Error> {

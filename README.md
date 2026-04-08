@@ -4,7 +4,7 @@ Minimal end-to-end test harness for a Discord voice bot with a hybrid Rust + Pyt
 
 Rust voice gateway/receiver
 -> buffered PCM utterance chunks
--> Python FastAPI STT + wake-word gate + TTS service
+-> Python FastAPI STT + conversation memory + OpenAI reply generation + TTS service
 -> Rust playback back into the same voice channel
 
 ## Architecture Summary
@@ -14,11 +14,13 @@ Rust voice gateway/receiver
   - Owns voice join/leave, receive, and playback with `songbird`
   - Buffers short utterances per SSRC using a simple energy + silence heuristic
   - Resolves SSRCs back to Discord users and maintains a per-guild speaker registry
-  - Sends finalized WAV chunks to the local Python service over HTTP
+  - Sends finalized WAV chunks plus speaker/call metadata to the local Python service over HTTP
 - `python-service/`
   - Exposes a small FastAPI service
   - Runs local STT with `faster-whisper`
-  - Only responds when the transcript explicitly addresses the bot
+  - Maintains bounded per-guild conversation memory with speaker attribution
+  - Builds a structured prompt with guild/channel/participant awareness
+  - Generates replies through an LLM client wrapper
   - Synthesizes reply audio with AWS Polly
 
 ## File Tree
@@ -30,7 +32,11 @@ Rust voice gateway/receiver
 ├── README.md
 ├── python-service
 │   ├── app.py
+│   ├── conversation_store.py
+│   ├── llm_client.py
 │   ├── logic.py
+│   ├── prompt_builder.py
+│   ├── prompt_config.py
 │   └── requirements.txt
 └── rust-bot
     ├── Cargo.toml
@@ -47,6 +53,7 @@ Rust voice gateway/receiver
 - `songbird`: practical Rust voice stack with both send and receive support. Its `receive` feature exposes decoded audio via `VoiceTick`, which is exactly what this prototype needs.
 - `FastAPI`: the simplest clean local HTTP boundary between Rust and Python.
 - `faster-whisper`: easy local STT for a prototype, with decent CPU performance and very small integration code.
+- `openai`: straightforward hosted LLM integration with a clean provider boundary for future swaps.
 - `AWS Polly`: managed TTS with MP3 output and access to the British English `Brian` voice.
 
 ## Prerequisites
@@ -62,6 +69,7 @@ Rust voice gateway/receiver
   - `pip install`
   - Cargo dependency download
   - `faster-whisper` model download
+  - OpenAI API replies
   - AWS Polly voice synthesis
   - AWS credentials configured for Polly access
 
@@ -101,15 +109,32 @@ Important variables:
 - `DISCORD_TOKEN`
 - `PYTHON_SERVICE_URL`
 - `FASTER_WHISPER_MODEL`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
 - `AWS_REGION`
 - `POLLY_VOICE_ID`
 - `VOICE_ENERGY_THRESHOLD`
 - `VOICE_SILENCE_FRAMES`
 
-See [.env.example](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/.env.example) for the full list.
+See [.env.example](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/.env.example) for the full list.
 
 Put your real AWS credentials in your local `.env` file, not in `.env.example`.
 `.env` is already gitignored in this repo.
+
+OpenAI configuration is also local-only. Set at least:
+
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+
+Optional OpenAI tuning:
+
+- `OPENAI_BASE_URL`
+- `OPENAI_TIMEOUT_SECONDS`
+- `OPENAI_MAX_OUTPUT_TOKENS`
+
+Conversation-memory tuning:
+
+- `MAX_HISTORY_MESSAGES`
 
 `boto3` will read them through the standard AWS SDK credential chain, such as:
 
@@ -137,6 +162,7 @@ Expected startup behavior:
 
 - FastAPI starts on `127.0.0.1:8000` by default
 - `faster-whisper` loads the configured model
+- the OpenAI-backed LLM client is configured from environment
 - `/health` returns service status
 
 ## Run Rust Bot
@@ -181,15 +207,48 @@ If an SSRC cannot be mapped back to a Discord user in time, Rust falls back to a
 
 Speaker registry snapshots are written to `.runtime/guild-<guild_id>/speaker-registry.json`.
 
-## Wake Names
+## Prompt And Personality
 
-The bot only replies when the transcript contains one of these wake names:
+Bot personality and behavioral instructions live in [python-service/prompt_config.py](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/python-service/prompt_config.py).
+
+That file is the dedicated place to customize:
+
+- personality and role
+- tone and response style
+- multi-user conversation behavior
+- ambiguity handling
+- voice-response constraints
+
+## Conversation Memory
+
+Python owns conversation memory because it already owns prompt assembly and reply generation.
+
+- Memory is kept per guild in-process only.
+- Each stored message records:
+  - timestamp
+  - speaker id
+  - speaker name
+  - role (`user` or `assistant`)
+  - text
+- Memory is bounded by `MAX_HISTORY_MESSAGES`.
+
+This keeps the Rust voice path simple while giving the LLM speaker-attributed context.
+
+## Wake Names And Reply Gating
+
+The bot still recognizes these wake names:
 
 - `butler`
 - `monkey`
 - `monkey butler`
+- `clanker`
 
-Matching is case-insensitive and normalized across simple punctuation and spacing differences. If an utterance is not addressed, Python returns a no-op response and Rust does not enqueue playback.
+Matching is case-insensitive and normalized across simple punctuation and spacing differences.
+
+Reply behavior is now:
+
+- respond immediately when the utterance includes a wake name
+- otherwise return a no-op response and do not enqueue playback
 
 Edge cases handled:
 
@@ -210,23 +269,51 @@ Edge cases handled:
 6. Speak a short phrase like:
    - `butler hello`
    - `monkey, what time is it`
-   - `monkey butler say test successful`
-   - `butler who is speaking`
+   - `butler who was Bob talking about`
+   - `and what about tomorrow`
 7. Confirm Rust logs show:
    - speaking SSRC mapped to a Discord user
    - receiving audio frames
    - speech chunk finalized
-   - transcript with speaker metadata and addressed / ignored outcome
-   - selected response text only when addressed
-   - audio queued to Discord only when addressed
+   - transcript with speaker metadata plus guild/channel/participant context
+   - addressed / follow-up / ignored outcome
+   - selected response text from the Python service
+   - audio queued to Discord only when `should_respond = true`
 8. Confirm Python logs show:
    - STT request received
    - transcript text and speaker metadata
-   - ignored reason for unaddressed speech or selected reply for addressed speech
-   - Polly TTS generated only when addressed
+   - conversation-memory updates
+   - structured LLM call context
+   - Polly TTS generation only when a reply is produced
 9. Listen for the reply in the voice channel.
 10. Send `!leave`.
 11. Confirm clean disconnect in logs.
+
+## Rust To Python Request Schema
+
+Each finalized utterance now includes the conversation-aware context Python needs to build a prompt:
+
+- `guild_id`
+- `guild_name`
+- `voice_channel_id`
+- `voice_channel_name`
+- `speaker_id`
+- `discord_user_id`
+- `discord_username`
+- `discord_display_name`
+- `users_in_call`
+- `ssrc`
+- `speaker_resolution`
+- `utterance_id`
+- `sample_rate`
+- `channels`
+- `audio_base64`
+
+`users_in_call` contains user descriptors with:
+
+- `discord_user_id`
+- `username`
+- `display_name`
 
 ## Prototype Behavior
 
@@ -235,18 +322,21 @@ Example flow:
 1. User sends `!join`
 2. Bot joins the voice channel
 3. User says `butler, what time is it`
-4. Rust buffers a short utterance, resolves the speaker from SSRC, and posts speaker-aware metadata to Python
-5. Python transcribes the utterance and checks whether it addressed the bot
-6. Intent logic selects a reply only when the wake name was present
-7. Python generates MP3 TTS only for addressed utterances
-8. Rust queues the MP3 into the Songbird call only when `should_respond = true`
-9. Bot speaks the reply
-10. User sends `!leave`
+4. Rust buffers a short utterance, resolves the speaker from SSRC, and posts speaker-aware metadata plus current participants to Python
+5. Python transcribes the utterance and updates per-guild conversation memory
+6. Python builds a structured prompt from personality rules, environment context, participants, recent history, and the latest utterance
+7. The OpenAI-backed LLM client generates a reply
+8. Python generates MP3 TTS for that reply
+9. Rust queues the MP3 into the Songbird call only when `should_respond = true`
+10. Bot speaks the reply
+11. User sends `!leave`
 
-Example speaker-aware query:
+Because memory is speaker-attributed, follow-up turns from different people can stay grounded, for example:
 
-- `butler who is speaking`
-  - Bot replies with the resolved Discord display name for the user attached to that utterance, for example `Alice is speaking.`
+- `[12:01:02] Alice: what time is it`
+- `[12:01:05] Butler: It's about 12:01 PM.`
+- `[12:01:09] Bob: what about tomorrow`
+- `[12:01:13] Butler: Tomorrow is ...`
 
 ## Logging and Debugging
 
@@ -258,20 +348,21 @@ Rust logs include:
 - speaker registry updates
 - receiving audio frames
 - speech chunk finalized
-- transcript text with Discord speaker metadata
-- addressed / ignored decision
+- transcript text with Discord speaker plus context metadata
+- addressed / follow-up / ignored decision
 - reply text
-- TTS audio queued only for addressed utterances
+- TTS audio queued only when a reply is produced
 - disconnect / shutdown
 
 Python logs include:
 
 - health checks
-- chunk receive size
+- chunk receive size plus guild/channel metadata
 - transcript text with speaker metadata
-- ignored reason when wake word was missing
-- chosen reply text for addressed speech
-- Polly TTS generation complete only for addressed speech
+- addressed vs. ignored decision
+- OpenAI request attempts and failures
+- chosen reply text or fallback behavior
+- Polly TTS generation complete only when a reply is produced
 
 To increase Rust log detail:
 
@@ -284,9 +375,11 @@ cargo run --manifest-path rust-bot\Cargo.toml
 
 - TTS uses AWS Polly, so TTS is not fully offline even though STT is local.
 - The first `faster-whisper` run downloads the configured model.
+- LLM replies require OpenAI API availability and credentials.
 - Utterance segmentation is intentionally simple and may miss very quiet speakers.
 - Speaker identity is based on Discord/Songbird SSRC mapping, not biometric voice matching.
-- There is no advanced mixed-audio diarization or conversation memory.
+- Conversation memory is in-memory only and resets when the Python service restarts.
+- There is no summarization of older history yet; the service keeps a bounded rolling window only.
 - The bot is driven by text commands, not slash commands.
 - Multiple people speaking at exactly the same time can still produce imperfect chunking.
 
@@ -294,15 +387,17 @@ cargo run --manifest-path rust-bot\Cargo.toml
 
 - This is a prototype, so short temp audio files are written to `.runtime/`.
 - Speaker handling is keyed by SSRC, mapped back to Discord users through `SpeakingStateUpdate`, and persisted as a lightweight per-guild registry.
-- The receive path is designed to stay light by doing only chunk buffering in the Songbird event handler and offloading HTTP/TTS work to spawned tasks.
-- The current speaker registry is intended for continuity and observability, and is the extension point for future embedding or fingerprint-based matching.
+- The receive path is designed to stay light by doing only chunk buffering in the Songbird event handler and offloading HTTP, LLM, and TTS work to spawned tasks.
+- The current LLM client is an OpenAI-backed adapter. A local model can be added later behind the same Python-side interface.
 
 ## Source Files
 
-Main Rust bot entrypoint: [rust-bot/src/main.rs](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/rust-bot/src/main.rs)
+Main Rust bot entrypoint: [rust-bot/src/main.rs](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/rust-bot/src/main.rs)
 
-Rust audio helper code: [rust-bot/src/audio.rs](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/rust-bot/src/audio.rs)
+Rust audio helper code: [rust-bot/src/audio.rs](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/rust-bot/src/audio.rs)
 
-Rust Python client: [rust-bot/src/python_client.rs](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/rust-bot/src/python_client.rs)
+Rust Python client: [rust-bot/src/python_client.rs](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/rust-bot/src/python_client.rs)
 
-Python FastAPI service: [python-service/app.py](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/python-service/app.py)
+Python FastAPI service: [python-service/app.py](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/python-service/app.py)
+
+Prompt config: [python-service/prompt_config.py](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Voice-Frontend/python-service/prompt_config.py)

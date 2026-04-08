@@ -11,12 +11,23 @@ pub struct PythonClient {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CallUser {
+    pub discord_user_id: Option<u64>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AudioProcessRequest {
     pub guild_id: u64,
+    pub guild_name: Option<String>,
+    pub voice_channel_id: Option<u64>,
+    pub voice_channel_name: Option<String>,
     pub speaker_id: String,
     pub discord_user_id: Option<u64>,
     pub discord_username: Option<String>,
     pub discord_display_name: Option<String>,
+    pub users_in_call: Vec<CallUser>,
     pub ssrc: u32,
     pub speaker_resolution: String,
     pub utterance_id: u64,

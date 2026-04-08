@@ -3,7 +3,7 @@ mod python_client;
 mod speaker_registry;
 
 use crate::audio::{frame_energy, write_wav_bytes, AudioPipelineConfig, SpeakerState};
-use crate::python_client::{AudioProcessRequest, PythonClient};
+use crate::python_client::{AudioProcessRequest, CallUser, PythonClient};
 use crate::speaker_registry::{DiscordSpeakerProfile, ResolvedSpeaker, SpeakerRegistry};
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
@@ -47,7 +47,9 @@ struct BotState {
 
 struct GuildAudioSession {
     guild_id: GuildId,
+    guild_name: Option<String>,
     channel_id: ChannelId,
+    channel_name: Option<String>,
     state: BotState,
     speakers: Mutex<std::collections::HashMap<u32, SpeakerState>>,
     utterance_counter: AtomicU64,
@@ -190,10 +192,16 @@ impl BotHandler {
             .join(guild_id, channel_id)
             .await
             .context("failed to join voice channel")?;
+        let guild_name = msg.guild(&ctx.cache).map(|guild| guild.name.clone());
+        let channel_name = msg
+            .guild(&ctx.cache)
+            .and_then(|guild| guild.channels.get(&channel_id).map(|channel| channel.name.clone()));
 
         let session = Arc::new(GuildAudioSession::new(
             guild_id,
+            guild_name,
             channel_id,
+            channel_name,
             self.state.clone(),
         ));
         self.seed_session_participants(ctx, &session).await;
@@ -364,7 +372,13 @@ impl BotHandler {
 }
 
 impl GuildAudioSession {
-    fn new(guild_id: GuildId, channel_id: ChannelId, state: BotState) -> Self {
+    fn new(
+        guild_id: GuildId,
+        guild_name: Option<String>,
+        channel_id: ChannelId,
+        channel_name: Option<String>,
+        state: BotState,
+    ) -> Self {
         let speaker_registry_path = state
             .playback_root
             .join(format!("guild-{}", guild_id.get()))
@@ -372,7 +386,9 @@ impl GuildAudioSession {
 
         Self {
             guild_id,
+            guild_name,
             channel_id,
+            channel_name,
             state,
             speakers: Mutex::new(std::collections::HashMap::new()),
             utterance_counter: AtomicU64::new(1),
@@ -528,6 +544,16 @@ impl GuildAudioSession {
 
     async fn process_utterance(self: Arc<Self>, utterance: FinalizedUtterance) -> Result<()> {
         let speaker = self.speaker_registry.resolve_speaker(utterance.ssrc);
+        let users_in_call = self
+            .speaker_registry
+            .current_participants()
+            .into_iter()
+            .map(|profile| CallUser {
+                discord_user_id: Some(profile.discord_user_id),
+                username: Some(profile.username),
+                display_name: Some(profile.display_name),
+            })
+            .collect::<Vec<_>>();
         self.speaker_registry.record_utterance(&speaker);
         self.speaker_registry.persist_async();
 
@@ -554,10 +580,14 @@ impl GuildAudioSession {
             .process_audio(
                 AudioProcessRequest {
                     guild_id: self.guild_id.get(),
+                    guild_name: self.guild_name.clone(),
+                    voice_channel_id: Some(self.channel_id.get()),
+                    voice_channel_name: self.channel_name.clone(),
                     speaker_id: speaker.speaker_id.clone(),
                     discord_user_id: speaker.discord_user_id,
                     discord_username: speaker.discord_username.clone(),
                     discord_display_name: speaker.discord_display_name.clone(),
+                    users_in_call,
                     ssrc: utterance.ssrc,
                     speaker_resolution: speaker.resolved_via.to_string(),
                     utterance_id: utterance.utterance_id,
