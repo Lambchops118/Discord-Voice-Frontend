@@ -18,7 +18,7 @@ Rust voice gateway/receiver
   - Exposes a small FastAPI service
   - Runs local STT with `faster-whisper`
   - Applies tiny rule-based intent logic
-  - Synthesizes reply audio with `edge-tts`
+  - Synthesizes reply audio with AWS Polly
 
 ## File Tree
 
@@ -44,7 +44,7 @@ Rust voice gateway/receiver
 - `songbird`: practical Rust voice stack with both send and receive support. Its `receive` feature exposes decoded audio via `VoiceTick`, which is exactly what this prototype needs.
 - `FastAPI`: the simplest clean local HTTP boundary between Rust and Python.
 - `faster-whisper`: easy local STT for a prototype, with decent CPU performance and very small integration code.
-- `edge-tts`: simple TTS with MP3 output, which keeps the Python side short and lets Rust play the reply directly.
+- `AWS Polly`: managed TTS with MP3 output and access to the British English `Brian` voice.
 
 ## Prerequisites
 
@@ -59,7 +59,8 @@ Rust voice gateway/receiver
   - `pip install`
   - Cargo dependency download
   - `faster-whisper` model download
-  - `edge-tts` voice synthesis
+  - AWS Polly voice synthesis
+  - AWS credentials configured for Polly access
 
 ## Discord Bot Setup
 
@@ -97,11 +98,22 @@ Important variables:
 - `DISCORD_TOKEN`
 - `PYTHON_SERVICE_URL`
 - `FASTER_WHISPER_MODEL`
-- `EDGE_TTS_VOICE`
+- `AWS_REGION`
+- `POLLY_VOICE_ID`
 - `VOICE_ENERGY_THRESHOLD`
 - `VOICE_SILENCE_FRAMES`
 
 See [.env.example](/c:/Users/jacksal1/Desktop/Voice Agent Frontend/Discord-Voice-Frontend/.env.example) for the full list.
+
+Put your real AWS credentials in your local `.env` file, not in `.env.example`.
+`.env` is already gitignored in this repo.
+
+`boto3` will read them through the standard AWS SDK credential chain, such as:
+
+- `aws configure`
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+- `AWS_SESSION_TOKEN` for temporary credentials
+- an AWS profile exposed through your shell environment
 
 ## Install Python Service
 
@@ -177,7 +189,7 @@ Edge cases handled:
    - STT request received
    - transcript text
    - selected reply
-   - TTS generated
+   - Polly TTS generated
 9. Listen for the reply in the voice channel.
 10. Send `!leave`.
 11. Confirm clean disconnect in logs.
@@ -217,7 +229,7 @@ Python logs include:
 - chunk receive size
 - transcript text
 - chosen reply text
-- TTS generation complete
+- Polly TTS generation complete
 
 To increase Rust log detail:
 
