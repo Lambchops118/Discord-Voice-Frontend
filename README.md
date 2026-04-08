@@ -4,7 +4,7 @@ Minimal end-to-end test harness for a Discord voice bot with a hybrid Rust + Pyt
 
 Rust voice gateway/receiver
 -> buffered PCM utterance chunks
--> Python FastAPI STT + intent + TTS service
+-> Python FastAPI STT + wake-word gate + TTS service
 -> Rust playback back into the same voice channel
 
 ## Architecture Summary
@@ -13,11 +13,12 @@ Rust voice gateway/receiver
   - Connects to Discord with `serenity`
   - Owns voice join/leave, receive, and playback with `songbird`
   - Buffers short utterances per SSRC using a simple energy + silence heuristic
+  - Resolves SSRCs back to Discord users and maintains a per-guild speaker registry
   - Sends finalized WAV chunks to the local Python service over HTTP
 - `python-service/`
   - Exposes a small FastAPI service
   - Runs local STT with `faster-whisper`
-  - Applies tiny rule-based intent logic
+  - Only responds when the transcript explicitly addresses the bot
   - Synthesizes reply audio with AWS Polly
 
 ## File Tree
@@ -29,13 +30,15 @@ Rust voice gateway/receiver
 ├── README.md
 ├── python-service
 │   ├── app.py
+│   ├── logic.py
 │   └── requirements.txt
 └── rust-bot
     ├── Cargo.toml
     └── src
         ├── audio.rs
         ├── main.rs
-        └── python_client.rs
+        ├── python_client.rs
+        └── speaker_registry.rs
 ```
 
 ## Why These Libraries
@@ -159,6 +162,35 @@ Expected startup behavior:
 - `!pingvoice`
   - Calls the Python service `/health` endpoint
 
+## Speaker Identity And Prototype Diarization
+
+This prototype does not do offline diarization over a mixed channel recording.
+
+Instead, "diarization" here means:
+
+- Songbird receives decoded audio per SSRC
+- Rust keeps an SSRC -> Discord user mapping from `SpeakingStateUpdate`
+- Rust keeps a per-guild speaker registry with:
+  - Discord user id
+  - username and best available display name
+  - latest SSRC and SSRC history
+  - first-seen and last-seen timestamps
+- Each finalized utterance is sent to Python with speaker metadata
+
+If an SSRC cannot be mapped back to a Discord user in time, Rust falls back to a stable placeholder such as `unknown:<ssrc>` and logs the resolution source.
+
+Speaker registry snapshots are written to `.runtime/guild-<guild_id>/speaker-registry.json`.
+
+## Wake Names
+
+The bot only replies when the transcript contains one of these wake names:
+
+- `butler`
+- `monkey`
+- `monkey butler`
+
+Matching is case-insensitive and normalized across simple punctuation and spacing differences. If an utterance is not addressed, Python returns a no-op response and Rust does not enqueue playback.
+
 Edge cases handled:
 
 - `!join` from a user not in voice
@@ -176,20 +208,21 @@ Edge cases handled:
    - joined voice channel
    - Songbird driver connected
 6. Speak a short phrase like:
-   - `hello bot`
-   - `what time is it`
-   - `say test successful`
+   - `butler hello`
+   - `monkey, what time is it`
+   - `monkey butler say test successful`
 7. Confirm Rust logs show:
+   - speaking SSRC mapped to a Discord user
    - receiving audio frames
    - speech chunk finalized
-   - transcript received
-   - selected response text
-   - audio queued to Discord
+   - transcript with speaker metadata and addressed / ignored outcome
+   - selected response text only when addressed
+   - audio queued to Discord only when addressed
 8. Confirm Python logs show:
    - STT request received
-   - transcript text
-   - selected reply
-   - Polly TTS generated
+   - transcript text and speaker metadata
+   - ignored reason for unaddressed speech or selected reply for addressed speech
+   - Polly TTS generated only when addressed
 9. Listen for the reply in the voice channel.
 10. Send `!leave`.
 11. Confirm clean disconnect in logs.
@@ -200,12 +233,12 @@ Example flow:
 
 1. User sends `!join`
 2. Bot joins the voice channel
-3. User says `hello bot`
-4. Rust buffers a short utterance and posts it to Python
-5. Python transcribes `hello bot`
-6. Intent logic selects `Hello! Voice pipeline is working.`
-7. Python generates MP3 TTS
-8. Rust queues the MP3 into the Songbird call
+3. User says `butler, what time is it`
+4. Rust buffers a short utterance, resolves the speaker from SSRC, and posts speaker-aware metadata to Python
+5. Python transcribes the utterance and checks whether it addressed the bot
+6. Intent logic selects a reply only when the wake name was present
+7. Python generates MP3 TTS only for addressed utterances
+8. Rust queues the MP3 into the Songbird call only when `should_respond = true`
 9. Bot speaks the reply
 10. User sends `!leave`
 
@@ -216,20 +249,23 @@ Rust logs include:
 - bot connected
 - joined channel
 - speaking SSRC mapped to user
+- speaker registry updates
 - receiving audio frames
 - speech chunk finalized
-- transcript text
+- transcript text with Discord speaker metadata
+- addressed / ignored decision
 - reply text
-- TTS audio queued
+- TTS audio queued only for addressed utterances
 - disconnect / shutdown
 
 Python logs include:
 
 - health checks
 - chunk receive size
-- transcript text
-- chosen reply text
-- Polly TTS generation complete
+- transcript text with speaker metadata
+- ignored reason when wake word was missing
+- chosen reply text for addressed speech
+- Polly TTS generation complete only for addressed speech
 
 To increase Rust log detail:
 
@@ -240,18 +276,20 @@ cargo run --manifest-path rust-bot\Cargo.toml
 
 ## Known Limitations
 
-- TTS uses `edge-tts`, so TTS is not fully offline even though STT is local.
+- TTS uses AWS Polly, so TTS is not fully offline even though STT is local.
 - The first `faster-whisper` run downloads the configured model.
 - Utterance segmentation is intentionally simple and may miss very quiet speakers.
-- There is no advanced diarization or conversation memory.
+- Speaker identity is based on Discord/Songbird SSRC mapping, not biometric voice matching.
+- There is no advanced mixed-audio diarization or conversation memory.
 - The bot is driven by text commands, not slash commands.
 - Multiple people speaking at exactly the same time can still produce imperfect chunking.
 
 ## Rough Edges Worth Knowing
 
 - This is a prototype, so short temp audio files are written to `.runtime/`.
-- Speaker handling is keyed by SSRC and mapped back to Discord users through `SpeakingStateUpdate`.
+- Speaker handling is keyed by SSRC, mapped back to Discord users through `SpeakingStateUpdate`, and persisted as a lightweight per-guild registry.
 - The receive path is designed to stay light by doing only chunk buffering in the Songbird event handler and offloading HTTP/TTS work to spawned tasks.
+- The current speaker registry is intended for continuity and observability, and is the extension point for future embedding or fingerprint-based matching.
 
 ## Source Files
 

@@ -1,8 +1,10 @@
 mod audio;
 mod python_client;
+mod speaker_registry;
 
 use crate::audio::{frame_energy, write_wav_bytes, AudioPipelineConfig, SpeakerState};
-use crate::python_client::PythonClient;
+use crate::python_client::{AudioProcessRequest, PythonClient};
+use crate::speaker_registry::{DiscordSpeakerProfile, ResolvedSpeaker, SpeakerRegistry};
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
 use serenity::{
@@ -12,6 +14,7 @@ use serenity::{
         channel::Message,
         gateway::Ready,
         id::{ChannelId, GuildId},
+        voice::VoiceState,
     },
 };
 use songbird::{
@@ -44,9 +47,11 @@ struct BotState {
 
 struct GuildAudioSession {
     guild_id: GuildId,
+    channel_id: ChannelId,
     state: BotState,
     speakers: Mutex<std::collections::HashMap<u32, SpeakerState>>,
     utterance_counter: AtomicU64,
+    speaker_registry: SpeakerRegistry,
 }
 
 #[derive(Clone)]
@@ -61,6 +66,7 @@ struct VoiceReceiver {
 
 struct FinalizedUtterance {
     utterance_id: u64,
+    ssrc: u32,
     samples: Vec<i16>,
 }
 
@@ -99,6 +105,21 @@ impl SerenityEventHandler for BotHandler {
                 .reply(&ctx.http, format!("Voice command failed: {error:#}"))
                 .await;
         }
+    }
+
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        let Some(guild_id) = new.guild_id.or_else(|| old.as_ref().and_then(|state| state.guild_id)) else {
+            return;
+        };
+
+        let Some(session) = self.state.sessions.get(&guild_id).map(|entry| Arc::clone(entry.value())) else {
+            return;
+        };
+
+        let profile = resolve_speaker_profile(&ctx, guild_id, &new);
+        session
+            .on_voice_state_update(new.user_id, new.channel_id, profile)
+            .await;
     }
 }
 
@@ -170,7 +191,12 @@ impl BotHandler {
             .await
             .context("failed to join voice channel")?;
 
-        let session = Arc::new(GuildAudioSession::new(guild_id, self.state.clone()));
+        let session = Arc::new(GuildAudioSession::new(
+            guild_id,
+            channel_id,
+            self.state.clone(),
+        ));
+        self.seed_session_participants(ctx, &session).await;
         let receiver = VoiceReceiver {
             session: session.clone(),
         };
@@ -214,6 +240,45 @@ impl BotHandler {
         .context("failed to send join reply")?;
 
         Ok(())
+    }
+
+    async fn seed_session_participants(&self, ctx: &Context, session: &Arc<GuildAudioSession>) {
+        let Some(guild) = session.guild_id.to_guild_cached(&ctx.cache) else {
+            warn!(
+                guild_id = session.guild_id.get(),
+                "failed to seed session participants because guild cache was unavailable"
+            );
+            return;
+        };
+
+        let mut seeded = 0usize;
+        for (user_id, voice_state) in &guild.voice_states {
+            if voice_state.channel_id != Some(session.channel_id) {
+                continue;
+            }
+
+            let profile = voice_state
+                .member
+                .as_ref()
+                .map(DiscordSpeakerProfile::from_member)
+                .or_else(|| {
+                    guild.members
+                        .get(user_id)
+                        .map(|member| DiscordSpeakerProfile::from_member(&member))
+                });
+
+            session
+                .speaker_registry
+                .update_voice_state(*user_id, true, profile);
+            seeded += 1;
+        }
+
+        info!(
+            guild_id = session.guild_id.get(),
+            channel_id = session.channel_id.get(),
+            seeded_participants = seeded,
+            "seeded speaker registry from current voice channel"
+        );
     }
 
     async fn handle_leave(&self, ctx: &Context, msg: &Message) -> Result<()> {
@@ -299,24 +364,60 @@ impl BotHandler {
 }
 
 impl GuildAudioSession {
-    fn new(guild_id: GuildId, state: BotState) -> Self {
+    fn new(guild_id: GuildId, channel_id: ChannelId, state: BotState) -> Self {
+        let speaker_registry_path = state
+            .playback_root
+            .join(format!("guild-{}", guild_id.get()))
+            .join("speaker-registry.json");
+
         Self {
             guild_id,
+            channel_id,
             state,
             speakers: Mutex::new(std::collections::HashMap::new()),
             utterance_counter: AtomicU64::new(1),
+            speaker_registry: SpeakerRegistry::new(guild_id, speaker_registry_path),
         }
     }
 
     async fn on_speaking_update(&self, speaking: &Speaking) {
-        if speaking.user_id.is_some() {
+        if let Some(user_id) = speaking.user_id {
+            let discord_user_id = serenity::all::UserId::new(user_id.0);
+            self.speaker_registry
+                .update_ssrc_mapping(speaking.ssrc, discord_user_id);
             debug!(
                 guild_id = self.guild_id.get(),
                 ssrc = speaking.ssrc,
-                user_id = ?speaking.user_id,
+                user_id = user_id.0,
                 "mapped speaking SSRC to user"
             );
+        } else {
+            warn!(
+                guild_id = self.guild_id.get(),
+                ssrc = speaking.ssrc,
+                "speaking update arrived without a Discord user mapping"
+            );
         }
+    }
+
+    async fn on_voice_state_update(
+        &self,
+        user_id: serenity::model::id::UserId,
+        channel_id: Option<ChannelId>,
+        profile: Option<DiscordSpeakerProfile>,
+    ) {
+        let is_in_session_channel = channel_id == Some(self.channel_id);
+        self.speaker_registry
+            .update_voice_state(user_id, is_in_session_channel, profile.clone());
+
+        debug!(
+            guild_id = self.guild_id.get(),
+            voice_channel_id = channel_id.map(|id| id.get()),
+            session_channel_id = self.channel_id.get(),
+            discord_user_id = user_id.get(),
+            in_session_channel = is_in_session_channel,
+            "updated session voice state"
+        );
     }
 
     async fn on_voice_tick(self: &Arc<Self>, tick: &songbird::events::context_data::VoiceTick) {
@@ -418,35 +519,68 @@ impl GuildAudioSession {
             "speech chunk finalized"
         );
 
-        Some(FinalizedUtterance { utterance_id, samples })
+        Some(FinalizedUtterance {
+            utterance_id,
+            ssrc,
+            samples,
+        })
     }
 
     async fn process_utterance(self: Arc<Self>, utterance: FinalizedUtterance) -> Result<()> {
+        let speaker = self.speaker_registry.resolve_speaker(utterance.ssrc);
+        self.speaker_registry.record_utterance(&speaker);
+        self.speaker_registry.persist_async();
+
         let wav_bytes = write_wav_bytes(
             &utterance.samples,
             self.state.audio_config.sample_rate,
             self.state.audio_config.channels,
         )?;
 
+        if speaker.discord_user_id.is_none() {
+            warn!(
+                guild_id = self.guild_id.get(),
+                utterance_id = utterance.utterance_id,
+                ssrc = utterance.ssrc,
+                speaker_id = speaker.speaker_id.as_str(),
+                resolved_via = speaker.resolved_via,
+                "failed to resolve SSRC to a Discord user; using fallback speaker identity"
+            );
+        }
+
         let response = self
             .state
             .python
             .process_audio(
-                self.guild_id.get(),
-                None,
-                utterance.utterance_id,
-                self.state.audio_config.sample_rate,
-                self.state.audio_config.channels,
+                AudioProcessRequest {
+                    guild_id: self.guild_id.get(),
+                    speaker_id: speaker.speaker_id.clone(),
+                    discord_user_id: speaker.discord_user_id,
+                    discord_username: speaker.discord_username.clone(),
+                    discord_display_name: speaker.discord_display_name.clone(),
+                    ssrc: utterance.ssrc,
+                    speaker_resolution: speaker.resolved_via.to_string(),
+                    utterance_id: utterance.utterance_id,
+                    sample_rate: self.state.audio_config.sample_rate,
+                    channels: self.state.audio_config.channels,
+                    audio_base64: String::new(),
+                },
                 wav_bytes,
             )
             .await?;
 
-        info!(
-            guild_id = self.guild_id.get(),
-            utterance_id = utterance.utterance_id,
-            transcript = response.transcript,
-            "received transcript from python service"
-        );
+        self.log_python_outcome(utterance.utterance_id, &speaker, &response);
+
+        if !response.should_respond {
+            debug!(
+                guild_id = self.guild_id.get(),
+                utterance_id = utterance.utterance_id,
+                speaker_id = speaker.speaker_id.as_str(),
+                ignore_reason = response.ignore_reason.as_deref().unwrap_or("not_provided"),
+                "skipping playback because the utterance was ignored"
+            );
+            return Ok(());
+        }
 
         let Some(reply_text) = response.reply_text.clone() else {
             debug!(
@@ -460,7 +594,7 @@ impl GuildAudioSession {
         info!(
             guild_id = self.guild_id.get(),
             utterance_id = utterance.utterance_id,
-            reply = reply_text,
+            reply = reply_text.as_str(),
             "selected response text"
         );
 
@@ -536,6 +670,58 @@ impl GuildAudioSession {
             }
         });
     }
+
+    fn log_python_outcome(
+        &self,
+        utterance_id: u64,
+        speaker: &ResolvedSpeaker,
+        response: &crate::python_client::AudioProcessResponse,
+    ) {
+        let speaker_label = speaker
+            .discord_display_name
+            .as_deref()
+            .unwrap_or(speaker.speaker_id.as_str());
+
+        info!(
+            guild_id = self.guild_id.get(),
+            utterance_id,
+            ssrc = speaker.ssrc,
+            speaker_id = speaker.speaker_id.as_str(),
+            discord_user_id = speaker.discord_user_id,
+            discord_username = speaker.discord_username.as_deref(),
+            discord_display_name = speaker.discord_display_name.as_deref(),
+            resolved_via = speaker.resolved_via,
+            transcript = response.transcript.as_str(),
+            should_respond = response.should_respond,
+            ignore_reason = response.ignore_reason.as_deref(),
+            "processed utterance transcript"
+        );
+
+        if !response.should_respond {
+            debug!(
+                guild_id = self.guild_id.get(),
+                utterance_id,
+                speaker = speaker_label,
+                ignore_reason = response.ignore_reason.as_deref().unwrap_or("not_provided"),
+                "utterance did not trigger a response"
+            );
+        }
+    }
+}
+
+fn resolve_speaker_profile(
+    ctx: &Context,
+    guild_id: GuildId,
+    voice_state: &VoiceState,
+) -> Option<DiscordSpeakerProfile> {
+    if let Some(member) = voice_state.member.as_ref() {
+        return Some(DiscordSpeakerProfile::from_member(member));
+    }
+
+    guild_id
+        .to_guild_cached(&ctx.cache)
+        .and_then(|guild| guild.members.get(&voice_state.user_id).cloned())
+        .map(|member| DiscordSpeakerProfile::from_member(&member))
 }
 
 #[tokio::main]

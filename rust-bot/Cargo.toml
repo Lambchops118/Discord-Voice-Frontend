@@ -11,6 +11,7 @@ dotenvy = "0.15"
 hound = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "http", "model", "rustls_backend", "cache"] }
 songbird = { git = "https://github.com/serenity-rs/songbird.git", branch = "next", features = ["receive", "builtin-queue", "serenity", "rustls"] }
 symphonia = { version = "0.5", features = ["mp3", "wav", "pcm"] }

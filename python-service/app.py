@@ -4,7 +4,6 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
+from logic import choose_reply, is_addressed
 
 load_dotenv()
 
@@ -45,7 +45,12 @@ app = FastAPI(title="Discord Voice Prototype Service")
 
 class AudioProcessRequest(BaseModel):
     guild_id: int
-    speaker_id: Optional[int] = None
+    speaker_id: str
+    discord_user_id: Optional[int] = None
+    discord_username: Optional[str] = None
+    discord_display_name: Optional[str] = None
+    ssrc: int
+    speaker_resolution: str
     utterance_id: int
     sample_rate: int
     channels: int
@@ -54,6 +59,8 @@ class AudioProcessRequest(BaseModel):
 
 class AudioProcessResponse(BaseModel):
     transcript: str
+    should_respond: bool
+    ignore_reason: Optional[str] = None
     reply_text: Optional[str] = None
     tts_audio_base64: Optional[str] = None
     tts_audio_format: Optional[str] = None
@@ -135,11 +142,16 @@ async def health() -> HealthResponse:
 @app.post("/process-audio", response_model=AudioProcessResponse)
 async def process_audio(request: AudioProcessRequest) -> AudioProcessResponse:
     audio_bytes = base64.b64decode(request.audio_base64)
+    speaker_label = request.discord_display_name or request.speaker_id
     logger.info(
-        "received audio chunk guild_id=%s utterance_id=%s speaker_id=%s bytes=%s sample_rate=%s channels=%s",
+        "received audio chunk guild_id=%s utterance_id=%s speaker_id=%s discord_user_id=%s display_name=%s ssrc=%s resolved_via=%s bytes=%s sample_rate=%s channels=%s",
         request.guild_id,
         request.utterance_id,
         request.speaker_id,
+        request.discord_user_id,
+        speaker_label,
+        request.ssrc,
+        request.speaker_resolution,
         len(audio_bytes),
         request.sample_rate,
         request.channels,
@@ -155,41 +167,47 @@ async def process_audio(request: AudioProcessRequest) -> AudioProcessResponse:
         wav_path.unlink(missing_ok=True)
 
     if not transcript:
-        logger.info("empty transcript for utterance_id=%s", request.utterance_id)
-        return AudioProcessResponse(transcript="", reply_text=None)
+        logger.info(
+            "ignoring utterance_id=%s speaker=%s reason=empty_transcript",
+            request.utterance_id,
+            speaker_label,
+        )
+        return AudioProcessResponse(
+            transcript="",
+            should_respond=False,
+            ignore_reason="empty_transcript",
+        )
 
-    reply_text = choose_reply(transcript)
+    addressed = is_addressed(transcript)
     logger.info(
-        "selected response utterance_id=%s transcript=%r reply=%r",
+        "transcript analyzed utterance_id=%s speaker=%s transcript=%r addressed=%s",
         request.utterance_id,
+        speaker_label,
         transcript,
-        reply_text,
+        addressed,
     )
 
+    if not addressed:
+        logger.info(
+            "ignoring utterance_id=%s speaker=%s reason=not_addressed",
+            request.utterance_id,
+            speaker_label,
+        )
+        return AudioProcessResponse(
+            transcript=transcript,
+            should_respond=False,
+            ignore_reason="not_addressed",
+        )
+
+    reply_text = choose_reply(transcript)
     tts_audio = await voice_service.synthesize_tts(reply_text)
     return AudioProcessResponse(
         transcript=transcript,
+        should_respond=True,
         reply_text=reply_text,
         tts_audio_base64=base64.b64encode(tts_audio).decode("utf-8"),
         tts_audio_format="mp3",
     )
-
-
-def choose_reply(transcript: str) -> str:
-    normalized = transcript.lower().strip()
-
-    if "hello bot" in normalized:
-        return "Hello! Voice pipeline is working."
-    if "what time is it" in normalized:
-        current_time = datetime.now().strftime("%I:%M %p").lstrip("0")
-        return f"It is {current_time}."
-    if normalized.startswith("say "):
-        requested = transcript[4:].strip()
-        return f"Test successful. You asked me to say: {requested}"
-    if "test successful" in normalized:
-        return "Voice test successful."
-
-    return f"I heard you say: {transcript}"
 
 
 if __name__ == "__main__":

@@ -13,7 +13,12 @@ pub struct PythonClient {
 #[derive(Debug, Serialize)]
 pub struct AudioProcessRequest {
     pub guild_id: u64,
-    pub speaker_id: Option<u64>,
+    pub speaker_id: String,
+    pub discord_user_id: Option<u64>,
+    pub discord_username: Option<String>,
+    pub discord_display_name: Option<String>,
+    pub ssrc: u32,
+    pub speaker_resolution: String,
     pub utterance_id: u64,
     pub sample_rate: u32,
     pub channels: u16,
@@ -23,6 +28,8 @@ pub struct AudioProcessRequest {
 #[derive(Debug, Deserialize)]
 pub struct AudioProcessResponse {
     pub transcript: String,
+    pub should_respond: bool,
+    pub ignore_reason: Option<String>,
     pub reply_text: Option<String>,
     pub tts_audio_base64: Option<String>,
     pub tts_audio_format: Option<String>,
@@ -65,21 +72,10 @@ impl PythonClient {
 
     pub async fn process_audio(
         &self,
-        guild_id: u64,
-        speaker_id: Option<u64>,
-        utterance_id: u64,
-        sample_rate: u32,
-        channels: u16,
+        mut request: AudioProcessRequest,
         wav_bytes: Vec<u8>,
     ) -> Result<AudioProcessResponse> {
-        let request = AudioProcessRequest {
-            guild_id,
-            speaker_id,
-            utterance_id,
-            sample_rate,
-            channels,
-            audio_base64: STANDARD.encode(wav_bytes),
-        };
+        request.audio_base64 = STANDARD.encode(wav_bytes);
 
         let response = self
             .http
