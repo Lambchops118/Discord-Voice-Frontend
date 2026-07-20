@@ -6,7 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from openai import APIError, OpenAI
 
@@ -22,6 +22,20 @@ class LLMClient(Protocol):
         session_id: str = "",
         user_text: str = "",
     ) -> str:
+        ...
+
+    def stream_reply(
+        self,
+        model_input: list[dict[str, object]],
+        *,
+        session_id: str = "",
+        user_text: str = "",
+    ) -> Iterator[str]:
+        """Yield incremental text deltas for the reply.
+
+        Clients that cannot stream natively (e.g. Grok) satisfy this by yielding
+        the whole reply as a single delta, so callers get identical output shape.
+        """
         ...
 
 
@@ -81,6 +95,20 @@ class GrokLLMClient:
 
         return reply_text
 
+    def stream_reply(
+        self,
+        model_input: list[dict[str, object]],
+        *,
+        session_id: str = "",
+        user_text: str = "",
+    ) -> Iterator[str]:
+        # Grok's Responses call is one-shot, so we preserve existing behavior:
+        # generate the full reply, then hand it off as a single delta for the
+        # caller's sentence chunker to split and synthesize.
+        yield self.generate_reply(
+            model_input, session_id=session_id, user_text=user_text
+        )
+
 
 @dataclass
 class TalosConfig:
@@ -97,6 +125,9 @@ class TalosConfig:
     source: str
     mode: str
     timeout_seconds: float
+    # Relative path of the token-streaming SSE endpoint (POST). Mirrors
+    # talos/text/service_client.py:stream_message.
+    stream_path: str = "/chat/stream"
 
 
 class TalosLLMClient:
@@ -169,6 +200,155 @@ class TalosLLMClient:
         if not message:
             raise RuntimeError("No user utterance to send to TALOS")
         return self._chat(message, session_id)
+
+    def stream_reply(
+        self,
+        model_input: list[dict[str, object]],
+        *,
+        session_id: str = "",
+        user_text: str = "",
+    ) -> Iterator[str]:
+        message = user_text.strip()
+        if not message:
+            message = _latest_user_text(model_input)
+        if not message:
+            raise RuntimeError("No user utterance to send to TALOS")
+        yield from self._chat_stream(message, session_id)
+
+    def _chat_stream(self, message: str, session_id: str) -> Iterator[str]:
+        """Consume TALOS's ``POST /chat/stream`` SSE endpoint, yielding text deltas.
+
+        The SSE framing is standard (``data:`` lines terminated by a blank line);
+        the delta field name varies between agent builds, so ``_extract_delta``
+        accepts the common shapes. Falls back to the blocking ``/chat`` endpoint
+        if streaming is unavailable so a reply is still produced.
+        """
+        payload = {
+            "message": message,
+            "session_id": session_id or self.config.source,
+            "source": self.config.source,
+            "mode": self.config.mode,
+            "stream": True,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        url = urllib.parse.urljoin(
+            self.config.base_url.rstrip("/") + "/",
+            self.config.stream_path.lstrip("/"),
+        )
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        if self.config.token:
+            request.add_header("Authorization", f"Bearer {self.config.token}")
+
+        timeout = (
+            self.config.timeout_seconds if self.config.timeout_seconds > 0 else None
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            # 404/405 → this agent build has no streaming endpoint; degrade to
+            # the blocking call rather than failing the turn.
+            if exc.code in (404, 405, 501):
+                logger.warning(
+                    "TALOS stream endpoint unavailable (HTTP %s); falling back to /chat",
+                    exc.code,
+                )
+                yield self._chat(message, session_id)
+                return
+            raise RuntimeError(f"TALOS stream HTTP {exc.code}: {body_text or exc}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"TALOS stream connection error: {exc.reason}") from exc
+
+        emitted_any = False
+        try:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data_part = line[len("data:") :].strip()
+                if not data_part:
+                    continue
+                if data_part.upper() == "[DONE]":
+                    break
+
+                try:
+                    event = json.loads(data_part)
+                except json.JSONDecodeError:
+                    # Non-JSON line: treat the raw payload as a delta.
+                    emitted_any = True
+                    yield data_part
+                    continue
+
+                event_type = event.get("type") if isinstance(event, dict) else None
+                if event_type == "delta":
+                    # TALOS protocol: only ``delta`` events carry incremental
+                    # text. The terminal ``done`` event ALSO includes the full
+                    # ``text`` — extracting it here is what caused the reply to
+                    # play twice, so we intentionally ignore ``done``'s text.
+                    text = event.get("text") or ""
+                    if text:
+                        emitted_any = True
+                        yield text
+                elif event_type == "done":
+                    break
+                elif event_type == "error":
+                    raise RuntimeError(str(event.get("error") or "TALOS stream error"))
+                elif event_type is None:
+                    # Unknown schema (e.g. OpenAI-style): best-effort extraction.
+                    delta = _extract_delta(event)
+                    if delta:
+                        emitted_any = True
+                        yield delta
+                # Any other typed event is a control frame we don't need.
+        finally:
+            response.close()
+
+        if not emitted_any:
+            # The stream connected but yielded nothing usable (unexpected schema).
+            # Fall back so the user still hears a reply this turn.
+            logger.warning(
+                "TALOS stream produced no text deltas; falling back to /chat"
+            )
+            yield self._chat(message, session_id)
+
+
+def _extract_delta(obj: object) -> str:
+    """Best-effort extraction of a text delta from a parsed SSE payload with no
+    ``type`` field (e.g. an OpenAI-style event). Used only as a fallback for
+    non-TALOS servers; the TALOS protocol is handled explicitly by ``type``.
+    """
+    if isinstance(obj, str):
+        return obj
+    if not isinstance(obj, dict):
+        return ""
+    # OpenAI-style: {"choices": [{"delta": {"content": "..."}}]}
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                text = delta.get("content") or delta.get("text")
+                if isinstance(text, str):
+                    return text
+            text = first.get("text")
+            if isinstance(text, str):
+                return text
+    for key in ("delta", "token", "content", "text", "chunk", "response"):
+        value = obj.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 def _latest_user_text(model_input: list[dict[str, object]]) -> str:

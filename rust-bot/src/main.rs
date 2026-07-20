@@ -3,7 +3,7 @@ mod python_client;
 mod speaker_registry;
 
 use crate::audio::{frame_energy, write_wav_bytes, AudioPipelineConfig, SpeakerState};
-use crate::python_client::{AudioProcessRequest, CallUser, PythonClient};
+use crate::python_client::{AudioProcessRequest, CallUser, PythonClient, StreamFrame};
 use crate::speaker_registry::{DiscordSpeakerProfile, ResolvedSpeaker, SpeakerRegistry};
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
@@ -19,12 +19,13 @@ use serenity::{
 };
 use songbird::{
     driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
-    input::File as SongbirdFile,
+    input::{File as SongbirdFile, Input as SongbirdInput, RawAdapter},
     model::payload::Speaking,
     Event, EventContext as VoiceEventContext, EventHandler as VoiceEventHandler, SerenityInit,
     Songbird,
 };
 use std::{
+    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -43,6 +44,9 @@ struct BotState {
     python: PythonClient,
     songbird: Arc<Songbird>,
     sessions: Arc<DashMap<GuildId, Arc<GuildAudioSession>>>,
+    // When true, replies stream sentence-by-sentence over /process-audio/stream
+    // and play as each chunk arrives; otherwise the legacy one-shot path is used.
+    streaming_enabled: bool,
 }
 
 struct GuildAudioSession {
@@ -574,37 +578,49 @@ impl GuildAudioSession {
             );
         }
 
-        let response = self
-            .state
-            .python
-            .process_audio(
-                AudioProcessRequest {
-                    guild_id: self.guild_id.get(),
-                    guild_name: self.guild_name.clone(),
-                    voice_channel_id: Some(self.channel_id.get()),
-                    voice_channel_name: self.channel_name.clone(),
-                    speaker_id: speaker.speaker_id.clone(),
-                    discord_user_id: speaker.discord_user_id,
-                    discord_username: speaker.discord_username.clone(),
-                    discord_display_name: speaker.discord_display_name.clone(),
-                    users_in_call,
-                    ssrc: utterance.ssrc,
-                    speaker_resolution: speaker.resolved_via.to_string(),
-                    utterance_id: utterance.utterance_id,
-                    sample_rate: self.state.audio_config.sample_rate,
-                    channels: self.state.audio_config.channels,
-                    audio_base64: String::new(),
-                },
-                wav_bytes,
-            )
-            .await?;
+        let request = AudioProcessRequest {
+            guild_id: self.guild_id.get(),
+            guild_name: self.guild_name.clone(),
+            voice_channel_id: Some(self.channel_id.get()),
+            voice_channel_name: self.channel_name.clone(),
+            speaker_id: speaker.speaker_id.clone(),
+            discord_user_id: speaker.discord_user_id,
+            discord_username: speaker.discord_username.clone(),
+            discord_display_name: speaker.discord_display_name.clone(),
+            users_in_call,
+            ssrc: utterance.ssrc,
+            speaker_resolution: speaker.resolved_via.to_string(),
+            utterance_id: utterance.utterance_id,
+            sample_rate: self.state.audio_config.sample_rate,
+            channels: self.state.audio_config.channels,
+            audio_base64: String::new(),
+        };
 
-        self.log_python_outcome(utterance.utterance_id, &speaker, &response);
+        if self.state.streaming_enabled {
+            self.process_utterance_streaming(request, wav_bytes, &speaker, utterance.utterance_id)
+                .await
+        } else {
+            self.process_utterance_oneshot(request, wav_bytes, &speaker, utterance.utterance_id)
+                .await
+        }
+    }
+
+    /// Legacy one-shot path: single POST, single audio blob, then play it.
+    async fn process_utterance_oneshot(
+        self: &Arc<Self>,
+        request: AudioProcessRequest,
+        wav_bytes: Vec<u8>,
+        speaker: &ResolvedSpeaker,
+        utterance_id: u64,
+    ) -> Result<()> {
+        let response = self.state.python.process_audio(request, wav_bytes).await?;
+
+        self.log_python_outcome(utterance_id, speaker, &response);
 
         if !response.should_respond {
             debug!(
                 guild_id = self.guild_id.get(),
-                utterance_id = utterance.utterance_id,
+                utterance_id,
                 speaker_id = speaker.speaker_id.as_str(),
                 ignore_reason = response.ignore_reason.as_deref().unwrap_or("not_provided"),
                 "skipping playback because the utterance was ignored"
@@ -615,7 +631,7 @@ impl GuildAudioSession {
         let Some(reply_text) = response.reply_text.clone() else {
             debug!(
                 guild_id = self.guild_id.get(),
-                utterance_id = utterance.utterance_id,
+                utterance_id,
                 "python service returned no reply text"
             );
             return Ok(());
@@ -623,7 +639,7 @@ impl GuildAudioSession {
 
         info!(
             guild_id = self.guild_id.get(),
-            utterance_id = utterance.utterance_id,
+            utterance_id,
             reply = reply_text.as_str(),
             "selected response text"
         );
@@ -631,20 +647,170 @@ impl GuildAudioSession {
         let Some(audio_base64) = response.tts_audio_base64.as_deref() else {
             return Ok(());
         };
-
         let tts_bytes = self.state.python.decode_audio(audio_base64)?;
-        let extension = response
-            .tts_audio_format
-            .as_deref()
-            .unwrap_or("mp3")
-            .trim_start_matches('.');
+        let format = response.tts_audio_format.as_deref().unwrap_or("pcm");
+
+        if format == "pcm" {
+            let sample_rate = response.tts_sample_rate.unwrap_or(16_000);
+            let channels = response.tts_channels.unwrap_or(1);
+            self.enqueue_pcm(&tts_bytes, sample_rate, channels, utterance_id)
+                .await?;
+        } else {
+            self.write_and_queue_file(&tts_bytes, format, utterance_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Streaming path: consume NDJSON frames and enqueue each synthesized
+    /// sentence as it arrives, so playback starts on the first sentence.
+    async fn process_utterance_streaming(
+        self: &Arc<Self>,
+        request: AudioProcessRequest,
+        wav_bytes: Vec<u8>,
+        speaker: &ResolvedSpeaker,
+        utterance_id: u64,
+    ) -> Result<()> {
+        let mut rx = self
+            .state
+            .python
+            .process_audio_stream(request, wav_bytes)
+            .await?;
+
+        let mut enqueued = 0u64;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                Ok(StreamFrame::Meta {
+                    transcript,
+                    should_respond,
+                    ignore_reason,
+                }) => {
+                    info!(
+                        guild_id = self.guild_id.get(),
+                        utterance_id,
+                        speaker_id = speaker.speaker_id.as_str(),
+                        transcript = transcript.as_str(),
+                        should_respond,
+                        ignore_reason = ignore_reason.as_deref(),
+                        "stream transcript received"
+                    );
+                    if !should_respond {
+                        return Ok(());
+                    }
+                }
+                Ok(StreamFrame::Audio {
+                    seq,
+                    text,
+                    audio_format,
+                    sample_rate,
+                    channels,
+                    pcm,
+                }) => {
+                    let result = if audio_format == "pcm" {
+                        self.enqueue_pcm(&pcm, sample_rate, channels, utterance_id)
+                            .await
+                    } else {
+                        self.write_and_queue_file(&pcm, &audio_format, utterance_id)
+                            .await
+                    };
+                    match result {
+                        Ok(()) => {
+                            enqueued += 1;
+                            info!(
+                                guild_id = self.guild_id.get(),
+                                utterance_id,
+                                seq,
+                                sentence = text.as_str(),
+                                "enqueued streamed reply chunk"
+                            );
+                        }
+                        Err(error) => error!(
+                            ?error,
+                            utterance_id, seq, "failed to enqueue streamed reply chunk"
+                        ),
+                    }
+                }
+                Ok(StreamFrame::End { reply_text, chunks }) => {
+                    info!(
+                        guild_id = self.guild_id.get(),
+                        utterance_id,
+                        chunks,
+                        reply = reply_text.as_str(),
+                        "streamed reply complete"
+                    );
+                }
+                Ok(StreamFrame::Error { message }) => {
+                    warn!(
+                        guild_id = self.guild_id.get(),
+                        utterance_id,
+                        error = message.as_str(),
+                        "python stream reported an error"
+                    );
+                }
+                Err(error) => {
+                    error!(?error, utterance_id, "failed to read stream frame");
+                }
+            }
+        }
+
+        if enqueued == 0 {
+            debug!(
+                guild_id = self.guild_id.get(),
+                utterance_id, "stream produced no playable audio"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Build a Songbird input from raw 16-bit signed LE PCM and enqueue it.
+    /// The builtin queue plays inputs in enqueue order, preserving sentence order.
+    async fn enqueue_pcm(
+        &self,
+        pcm: &[u8],
+        sample_rate: u32,
+        channels: u16,
+        utterance_id: u64,
+    ) -> Result<()> {
+        let Some(call) = self.state.songbird.get(self.guild_id) else {
+            warn!(
+                guild_id = self.guild_id.get(),
+                utterance_id, "skipping TTS playback because no active call exists"
+            );
+            return Ok(());
+        };
+
+        // Songbird's raw input expects interleaved f32 samples; Polly gives us
+        // i16 mono, so convert and let Songbird resample to 48 kHz internally.
+        let f32_bytes = pcm_i16le_to_f32le(pcm);
+        let input: SongbirdInput =
+            RawAdapter::new(Cursor::new(f32_bytes), sample_rate, channels as u32).into();
+
+        {
+            let mut handler = call.lock().await;
+            handler.enqueue_input(input).await;
+        }
+
+        Ok(())
+    }
+
+    /// Fallback for non-PCM audio (e.g. TTS_AUDIO_FORMAT=mp3): persist to a temp
+    /// file so Songbird/Symphonia can demux it, enqueue, then clean up.
+    async fn write_and_queue_file(
+        &self,
+        bytes: &[u8],
+        format: &str,
+        utterance_id: u64,
+    ) -> Result<()> {
+        let extension = format.trim_start_matches('.');
         let playback_path = self
             .state
             .playback_root
             .join(format!("guild-{}", self.guild_id.get()))
             .join(format!(
                 "utterance-{}-reply-{}.{}",
-                utterance.utterance_id,
+                utterance_id,
                 millis_since_epoch(),
                 extension
             ));
@@ -655,11 +821,11 @@ impl GuildAudioSession {
                 .with_context(|| format!("failed to create playback directory {}", parent.display()))?;
         }
 
-        fs::write(&playback_path, tts_bytes)
+        fs::write(&playback_path, bytes)
             .await
             .with_context(|| format!("failed to write playback file {}", playback_path.display()))?;
 
-        self.queue_tts_file(&playback_path, utterance.utterance_id).await?;
+        self.queue_tts_file(&playback_path, utterance_id).await?;
         self.schedule_cleanup(playback_path);
 
         Ok(())
@@ -767,6 +933,10 @@ async fn main() -> Result<()> {
     let playback_root = std::env::var("VOICE_TEMP_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".runtime"));
+    // Streaming is on by default; set VOICE_STREAMING=0 for the legacy one-shot path.
+    let streaming_enabled = std::env::var("VOICE_STREAMING")
+        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | ""))
+        .unwrap_or(true);
 
     fs::create_dir_all(&playback_root)
         .await
@@ -778,6 +948,7 @@ async fn main() -> Result<()> {
     ));
     let songbird = Songbird::serenity_from_config(songbird_config);
 
+    info!(streaming_enabled, "reply transport configured");
     let state = BotState {
         command_prefix,
         playback_root,
@@ -785,6 +956,7 @@ async fn main() -> Result<()> {
         python: PythonClient::new(python_service_url)?,
         songbird: songbird.clone(),
         sessions: Arc::new(DashMap::new()),
+        streaming_enabled,
     };
 
     let intents = serenity::all::GatewayIntents::GUILDS
@@ -819,6 +991,18 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+/// Convert interleaved 16-bit signed little-endian PCM (Polly's `pcm` output)
+/// into the interleaved `f32` little-endian bytes Songbird's [`RawAdapter`] wants.
+fn pcm_i16le_to_f32le(pcm: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pcm.len() * 2);
+    for frame in pcm.chunks_exact(2) {
+        let sample = i16::from_le_bytes([frame[0], frame[1]]);
+        let normalized = sample as f32 / 32768.0;
+        out.extend_from_slice(&normalized.to_le_bytes());
+    }
+    out
 }
 
 fn millis_since_epoch() -> u128 {

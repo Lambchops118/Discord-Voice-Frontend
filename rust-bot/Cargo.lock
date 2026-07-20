@@ -2703,6 +2703,7 @@ dependencies = [
  "base64",
  "dashmap 6.1.0",
  "dotenvy",
+ "futures-util",
  "hound",
  "reqwest",
  "serde",
