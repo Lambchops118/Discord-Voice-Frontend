@@ -14,7 +14,7 @@ from conversation_store import ConversationMessage, ConversationStore
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from faster_whisper import WhisperModel
-from llm_client import OpenAIConfig, OpenAILLMClient
+from llm_client import GrokConfig, GrokLLMClient, TalosConfig, TalosLLMClient
 from logic import is_addressed, strip_wake_words, wake_word_required
 from pydantic import BaseModel, Field
 from prompt_builder import (
@@ -46,14 +46,29 @@ class Settings:
     )
     polly_voice_id: str = os.getenv("POLLY_VOICE_ID", "Brian")
     polly_engine: str = os.getenv("POLLY_ENGINE", "neural")
-    openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
-    openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
-    openai_timeout_seconds: float = float(
-        os.getenv("OPENAI_TIMEOUT_SECONDS", "20")
+    xai_api_key: Optional[str] = os.getenv("XAI_API_KEY")
+    xai_model: str = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
+    xai_base_url: str = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")
+    xai_timeout_seconds: float = float(
+        os.getenv("XAI_TIMEOUT_SECONDS", "20")
     )
-    openai_max_output_tokens: int = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "180"))
+    xai_max_output_tokens: int = int(os.getenv("XAI_MAX_OUTPUT_TOKENS", "180"))
     max_history_messages: int = int(os.getenv("MAX_HISTORY_MESSAGES", "24"))
+    # Reply backend: "talos" routes to the TALOS brain over HTTP; "grok" (or any
+    # other value) uses the hosted OpenAI-Responses client above.
+    llm_provider: str = os.getenv("LLM_PROVIDER", "talos").strip().lower()
+    # TALOS text agent (POST /chat) — same endpoint the TALOS GUI/voice worker use.
+    talos_base_url: str = os.getenv(
+        "TALOS_TEXT_AGENT_URL", "http://127.0.0.1:8420"
+    )
+    talos_token: str = os.getenv(
+        "TALOS_TEXT_AGENT_TOKEN", os.getenv("TEXT_AGENT_API_TOKEN", "")
+    )
+    talos_source: str = os.getenv("TALOS_SOURCE", "discord")
+    talos_mode: str = os.getenv("TALOS_MODE", "auto")
+    talos_timeout_seconds: float = float(
+        os.getenv("TALOS_TIMEOUT_SECONDS", "30")
+    )
 
 
 settings = Settings()
@@ -120,23 +135,46 @@ class VoiceService:
             config.polly_voice_id,
             config.polly_engine,
         )
-        self.llm = OpenAILLMClient(
-            OpenAIConfig(
-                api_key=config.openai_api_key,
-                model=config.openai_model,
-                base_url=config.openai_base_url,
-                timeout_seconds=config.openai_timeout_seconds,
-                max_output_tokens=config.openai_max_output_tokens,
+        self.provider = config.llm_provider
+        if self.provider == "talos":
+            self.llm = TalosLLMClient(
+                TalosConfig(
+                    base_url=config.talos_base_url,
+                    token=config.talos_token,
+                    source=config.talos_source,
+                    mode=config.talos_mode,
+                    timeout_seconds=config.talos_timeout_seconds,
+                )
             )
-        )
+            logger.info(
+                "configured llm provider=talos base_url=%s source=%s mode=%s timeout_seconds=%s",
+                config.talos_base_url,
+                config.talos_source,
+                config.talos_mode,
+                config.talos_timeout_seconds,
+            )
+        else:
+            self.llm = GrokLLMClient(
+                GrokConfig(
+                    api_key=config.xai_api_key,
+                    model=config.xai_model,
+                    base_url=config.xai_base_url,
+                    timeout_seconds=config.xai_timeout_seconds,
+                    max_output_tokens=config.xai_max_output_tokens,
+                )
+            )
+            logger.info(
+                "configured llm provider=grok enabled=%s model=%s base_url=%s timeout_seconds=%s",
+                self.llm.enabled,
+                config.xai_model,
+                config.xai_base_url,
+                config.xai_timeout_seconds,
+            )
         self.conversations = ConversationStore(
             max_history_messages=config.max_history_messages,
         )
         logger.info(
-            "configured llm provider=openai enabled=%s model=%s timeout_seconds=%s max_history_messages=%s",
-            self.llm.enabled,
-            config.openai_model,
-            config.openai_timeout_seconds,
+            "conversation history max_history_messages=%s",
             config.max_history_messages,
         )
 
@@ -188,6 +226,27 @@ class VoiceService:
             or request.discord_username
             or request.speaker_id
         )
+        session_id = f"discord-guild-{request.guild_id}"
+
+        if self.provider == "talos":
+            # TALOS keeps its own history/personality, so send just the utterance.
+            # In multi-user calls, prefix the speaker so TALOS can attribute turns.
+            message = user_text
+            if len(request.users_in_call) > 1:
+                message = f"{speaker_name}: {user_text}"
+            logger.info(
+                "calling talos guild_id=%s utterance_id=%s speaker=%s participants=%s addressed=%s session_id=%s",
+                request.guild_id,
+                request.utterance_id,
+                speaker_name,
+                len(request.users_in_call),
+                addressed,
+                session_id,
+            )
+            return self.llm.generate_reply(
+                [], session_id=session_id, user_text=message
+            )
+
         prompt_context = build_prompt_context(
             guild_id=request.guild_id,
             guild_name=request.guild_name,
@@ -222,7 +281,9 @@ class VoiceService:
             len(recent_messages),
             addressed,
         )
-        return self.llm.generate_reply(model_input)
+        return self.llm.generate_reply(
+            model_input, session_id=session_id, user_text=user_text
+        )
 
 
 voice_service = VoiceService(settings)

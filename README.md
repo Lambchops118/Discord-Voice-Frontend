@@ -4,7 +4,7 @@ Minimal end-to-end test harness for a Discord voice bot with a hybrid Rust + Pyt
 
 Rust voice gateway/receiver
 -> buffered PCM utterance chunks
--> Python FastAPI STT + conversation memory + OpenAI reply generation + TTS service
+-> Python FastAPI STT + conversation memory + Grok reply generation + TTS service
 -> Rust playback back into the same voice channel
 
 ## Architecture Summary
@@ -53,7 +53,7 @@ Rust voice gateway/receiver
 - `songbird`: practical Rust voice stack with both send and receive support. Its `receive` feature exposes decoded audio via `VoiceTick`, which is exactly what this prototype needs.
 - `FastAPI`: the simplest clean local HTTP boundary between Rust and Python.
 - `faster-whisper`: easy local STT for a prototype, with decent CPU performance and very small integration code.
-- `openai`: straightforward hosted LLM integration with a clean provider boundary for future swaps.
+- `openai`: used here as an OpenAI-compatible SDK against the xAI API.
 - `AWS Polly`: managed TTS with MP3 output and access to the British English `Brian` voice.
 
 ## Prerequisites
@@ -69,7 +69,7 @@ Rust voice gateway/receiver
   - `pip install`
   - Cargo dependency download
   - `faster-whisper` model download
-  - OpenAI API replies
+  - xAI Grok API replies
   - AWS Polly voice synthesis
   - AWS credentials configured for Polly access
 
@@ -109,8 +109,8 @@ Important variables:
 - `DISCORD_TOKEN`
 - `PYTHON_SERVICE_URL`
 - `FASTER_WHISPER_MODEL`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
+- `XAI_API_KEY`
+- `XAI_MODEL`
 - `AWS_REGION`
 - `POLLY_VOICE_ID`
 - `VOICE_ENERGY_THRESHOLD`
@@ -121,16 +121,16 @@ See [.env.example](/mnt/c/Users/aljac/Desktop/Butler Discord Frontend/Discord-Vo
 Put your real AWS credentials in your local `.env` file, not in `.env.example`.
 `.env` is already gitignored in this repo.
 
-OpenAI configuration is also local-only. Set at least:
+Grok configuration is also local-only. Set at least:
 
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
+- `XAI_API_KEY`
+- `XAI_MODEL`
 
-Optional OpenAI tuning:
+Optional xAI tuning:
 
-- `OPENAI_BASE_URL`
-- `OPENAI_TIMEOUT_SECONDS`
-- `OPENAI_MAX_OUTPUT_TOKENS`
+- `XAI_BASE_URL`
+- `XAI_TIMEOUT_SECONDS`
+- `XAI_MAX_OUTPUT_TOKENS`
 
 Conversation-memory tuning:
 
@@ -162,7 +162,7 @@ Expected startup behavior:
 
 - FastAPI starts on `127.0.0.1:8000` by default
 - `faster-whisper` loads the configured model
-- the OpenAI-backed LLM client is configured from environment
+- the Grok-backed LLM client is configured from environment
 - `/health` returns service status
 
 ## Run Rust Bot
@@ -326,7 +326,7 @@ Example flow:
 4. Rust buffers a short utterance, resolves the speaker from SSRC, and posts speaker-aware metadata plus current participants to Python
 5. Python transcribes the utterance and updates per-guild conversation memory
 6. Python builds a structured prompt from personality rules, environment context, participants, recent history, and the latest utterance
-7. The OpenAI-backed LLM client generates a reply
+7. The Grok-backed LLM client generates a reply
 8. Python generates MP3 TTS for that reply
 9. Rust queues the MP3 into the Songbird call only when `should_respond = true`
 10. Bot speaks the reply
@@ -361,7 +361,7 @@ Python logs include:
 - chunk receive size plus guild/channel metadata
 - transcript text with speaker metadata
 - addressed vs. ignored decision
-- OpenAI request attempts and failures
+- Grok request attempts and failures
 - chosen reply text or fallback behavior
 - Polly TTS generation complete only when a reply is produced
 
@@ -376,7 +376,7 @@ cargo run --manifest-path rust-bot\Cargo.toml
 
 - TTS uses AWS Polly, so TTS is not fully offline even though STT is local.
 - The first `faster-whisper` run downloads the configured model.
-- LLM replies require OpenAI API availability and credentials.
+- LLM replies require xAI API availability and credentials.
 - Utterance segmentation is intentionally simple and may miss very quiet speakers.
 - Speaker identity is based on Discord/Songbird SSRC mapping, not biometric voice matching.
 - Conversation memory is in-memory only and resets when the Python service restarts.
@@ -389,7 +389,7 @@ cargo run --manifest-path rust-bot\Cargo.toml
 - This is a prototype, so short temp audio files are written to `.runtime/`.
 - Speaker handling is keyed by SSRC, mapped back to Discord users through `SpeakingStateUpdate`, and persisted as a lightweight per-guild registry.
 - The receive path is designed to stay light by doing only chunk buffering in the Songbird event handler and offloading HTTP, LLM, and TTS work to spawned tasks.
-- The current LLM client is an OpenAI-backed adapter. A local model can be added later behind the same Python-side interface.
+- The current LLM client is a Grok-backed adapter. A local model can be added later behind the same Python-side interface.
 
 ## Source Files
 
